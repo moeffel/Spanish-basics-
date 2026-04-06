@@ -1,43 +1,79 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import * as SQLite from "expo-sqlite";
+import { Platform } from "react-native";
 
-const DB_NAME = "spanish_basics.db";
+// ---------------------------------------------------------------------------
+// Web storage (localStorage)
+// ---------------------------------------------------------------------------
 
-let dbInstance: SQLite.SQLiteDatabase | null = null;
-let dbReady = false;
-let dbReadyPromise: Promise<void> | null = null;
-
-function getDb(): SQLite.SQLiteDatabase {
-  if (!dbInstance) {
-    dbInstance = SQLite.openDatabaseSync(DB_NAME);
+function webGet<T>(key: string, defaultValue: T): T {
+  try {
+    const raw = localStorage.getItem(`sb_${key}`);
+    return raw ? (JSON.parse(raw) as T) : defaultValue;
+  } catch {
+    return defaultValue;
   }
-  return dbInstance;
 }
 
-function ensureTable(): Promise<void> {
-  if (dbReady) {
-    return Promise.resolve();
+function webSet<T>(key: string, value: T): void {
+  try {
+    localStorage.setItem(`sb_${key}`, JSON.stringify(value));
+  } catch (error) {
+    console.error(`useStorage: failed to persist key "${key}"`, error);
   }
-  if (dbReadyPromise) {
-    return dbReadyPromise;
-  }
-  dbReadyPromise = (async () => {
-    const db = getDb();
-    db.execSync(
-      "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+}
+
+// ---------------------------------------------------------------------------
+// Native storage (expo-sqlite) — lazy-loaded so the web bundle never imports it
+// ---------------------------------------------------------------------------
+
+let nativeDb: any = null;
+let nativeReady = false;
+
+async function ensureNativeDb() {
+  if (nativeReady) return;
+  const SQLite = await import("expo-sqlite");
+  nativeDb = SQLite.openDatabaseSync("spanish_basics.db");
+  nativeDb.execSync(
+    "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+  );
+  nativeReady = true;
+}
+
+function nativeGet<T>(key: string, defaultValue: T): T {
+  try {
+    const row = nativeDb?.getFirstSync<{ value: string }>(
+      "SELECT value FROM kv_store WHERE key = ?;",
+      [key]
     );
-    dbReady = true;
-  })();
-  return dbReadyPromise;
+    return row ? (JSON.parse(row.value) as T) : defaultValue;
+  } catch {
+    return defaultValue;
+  }
 }
+
+function nativeSet<T>(key: string, value: T): void {
+  try {
+    const serialized = JSON.stringify(value);
+    nativeDb?.runSync(
+      "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?);",
+      [key, serialized]
+    );
+  } catch (error) {
+    console.error(`useStorage: failed to persist key "${key}"`, error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+const isWeb = Platform.OS === "web";
 
 /**
- * A persistent key-value storage hook backed by expo-sqlite.
+ * A persistent key-value storage hook.
+ * Uses localStorage on web, expo-sqlite on native.
  *
  * Returns [value, setValue, isLoading].
- * - value: the current stored value (or defaultValue while loading)
- * - setValue: async function to update and persist the value
- * - isLoading: true until the initial value has been read from storage
  */
 export function useStorage<T>(
   key: string,
@@ -45,34 +81,25 @@ export function useStorage<T>(
 ): [T, (val: T) => Promise<void>, boolean] {
   const [value, setValue] = useState<T>(defaultValue);
   const [isLoading, setIsLoading] = useState(true);
-  const defaultValueRef = useRef(defaultValue);
+  const defaultRef = useRef(defaultValue);
 
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
       try {
-        await ensureTable();
-        const db = getDb();
-        const row = db.getFirstSync<{ value: string }>(
-          "SELECT value FROM kv_store WHERE key = ?;",
-          [key]
-        );
-        if (!cancelled) {
-          if (row) {
-            setValue(JSON.parse(row.value) as T);
-          } else {
-            setValue(defaultValueRef.current);
-          }
+        if (isWeb) {
+          const stored = webGet(key, defaultRef.current);
+          if (!cancelled) setValue(stored);
+        } else {
+          await ensureNativeDb();
+          const stored = nativeGet(key, defaultRef.current);
+          if (!cancelled) setValue(stored);
         }
       } catch {
-        if (!cancelled) {
-          setValue(defaultValueRef.current);
-        }
+        if (!cancelled) setValue(defaultRef.current);
       } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
+        if (!cancelled) setIsLoading(false);
       }
     })();
 
@@ -84,16 +111,11 @@ export function useStorage<T>(
   const updateValue = useCallback(
     async (newValue: T) => {
       setValue(newValue);
-      try {
-        await ensureTable();
-        const db = getDb();
-        const serialized = JSON.stringify(newValue);
-        db.runSync(
-          "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?);",
-          [key, serialized]
-        );
-      } catch (error) {
-        console.error(`useStorage: failed to persist key "${key}"`, error);
+      if (isWeb) {
+        webSet(key, newValue);
+      } else {
+        await ensureNativeDb();
+        nativeSet(key, newValue);
       }
     },
     [key]
