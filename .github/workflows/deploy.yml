@@ -30,7 +30,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: spanish-basics
-        run: npm ci --legacy-peer-deps
+        run: npm install --legacy-peer-deps
 
       - name: Export web build
         working-directory: spanish-basics
